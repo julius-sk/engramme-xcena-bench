@@ -42,6 +42,8 @@ movement, not recall quality.
 | `dran_mu/mu_kernel/mu_dran.cpp` | Lane C MU kernel (scan, local top-k, merge, mix) |
 | `dran_mu/dran_retrieve.cpp` | Experimental: `--place dram\|hybrid\|ssd` placement test; needs a card with an SSD tier in Computing mode |
 | `dran_mu/im_probe.cpp` | InfiniteMemory probe: one API call at a time, with status, time, device counter deltas and page-level data checks (`--part ABCD`) |
+| `dran_mu/im_examples.cpp` | Basic InfiniteMemory usage: plain memory, commit, prefetch before sparse reads, pin, preload → MU kernel → unload (`--ex 12345`) |
+| `persistent_cxl_cache/` | GNN data on GPU HBM + CXL DRAM cache + SSD: tiered store, mini-batch benchmark, offline cache-size simulator (see its README) |
 | `setup_new_server.sh` | Staged setup of a new host (see below) |
 
 ## Quick start on the reference server
@@ -50,7 +52,7 @@ The server is already configured; only the Python environment and the lane C bui
 are per account.
 
 ```bash
-cd ~/engramme-repro-lite
+cd ~/engramme-xcena-bench
 bash setup_new_server.sh py              # once: venv at ~/venv-torch (~2 GB download)
 (cd dran_mu && ./build.sh)               # once: builds dran_retrieve_lanec
 
