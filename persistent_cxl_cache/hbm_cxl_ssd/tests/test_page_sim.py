@@ -45,7 +45,7 @@ assert misses_for(d2, [20])[0] == 2000 and misses_for(d2, [200])[0] == 200, "ful
 N = 2000; deg = rng.integers(0, 30, N); rowptr = np.zeros(N+1, np.int64); np.cumsum(deg, out=rowptr[1:])
 colind = rng.integers(0, N, rowptr[-1]).astype(np.int64)
 mark = np.zeros(N, np.uint8)
-n_id, tgt, off = sample_batch(rowptr, colind, rng.choice(N, 50, replace=False), [5, 5], rng, mark)
+n_id, expd, tgt, off = sample_batch(rowptr, colind, rng.choice(N, 50, replace=False), [5, 5], rng, mark)
 assert (off >= 0).all() and (off < deg[tgt]).all() and mark.sum() == 0 and np.unique(n_id).size == n_id.size
 for name in ("original", "random", "degree", "rcm"):
     o = make_order(name, rowptr, colind, rng)

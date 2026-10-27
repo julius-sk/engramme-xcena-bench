@@ -1,20 +1,23 @@
-"""tiered_store.py - GNN feature table on GPU HBM -> CXL DRAM cache -> SSD.
+"""tiered_store.py - GNN graph structure and features on GPU HBM -> CXL DRAM cache -> SSD.
 
-Built to be compared with BaM / GIDS, so it uses the same split as GIDS:
+Placement (the method; GIDS is the baseline):
 
-    graph structure  pinned host memory (GIDS does the same); sampled on the GPU side.
-                     Optional --colind-on card puts col_idx on the device instead.
-    feature table    the storage tier. GIDS: GPU-initiated reads from the SSD via BaM, with a
-                     GPU software cache and a constant CPU buffer for hot nodes.
-                     Here: the XCENA device - its DRAM caches its SSD in hardware (512 KB pages),
-                     plus a static HBM cache of hot rows.
+    graph structure  CSC (indptr, indices) on the XCENA device by default (graph_on="card"):
+                     the device DRAM caches hot blocks, the SSD holds the full arrays.
+                     graph_on="split": indptr in HBM, indices on the device.
+                     graph_on="host":  both pinned in host DRAM, as GIDS does.
+    feature table    on the XCENA device; a static HBM cache holds the hottest rows.
+                     GIDS instead reads the SSD from GPU threads via BaM (4 KB lines), with a
+                     GPU software cache and a constant CPU buffer.
 
-So the only thing that differs from GIDS is the feature path:
+The device DRAM and its SSD look like one flat memory to the host; the device moves 512 KB
+pages between them by itself. Software controls how requests reach it, for indptr, indices
+and features alike:
 
     GPU: reduce        drop HBM hits, dedupe, sort by address
     host: prefetch     prefetchMemory once per distinct device page (async, overlaps SSD reads)
-    host: gather       index_select from the device into a pinned DRAM buffer
-    GPU: H2D + scatter copy the rows to the GPU and put them in batch order
+    host: gather       index_select from the device into pinned DRAM
+    GPU: H2D + scatter copy to the GPU and put the values back in request order
 
 Not here yet: a look-ahead cache policy (GIDS's window buffering is the counterpart), GPU
 zero-copy reads of the device, overlap of batch i+1's gather with batch i's compute.
@@ -77,16 +80,19 @@ class Stats:
         self.feat_rows = 0        # feature rows requested
         self.feat_hbm_hits = 0    # served from the HBM cache
         self.feat_pages = 0       # distinct 512 KB pages requested from the card for features
-        self.col_entries = 0      # col_idx entries read from the card
-        self.col_pages = 0        # distinct pages requested for col_idx
+        self.ptr_entries = 0      # indptr entries read (graph_on card / host)
+        self.ptr_pages = 0        # distinct device pages requested for indptr
+        self.col_entries = 0      # indices entries read
+        self.col_pages = 0        # distinct device pages requested for indices
         self.t_sample = 0.0
         self.t_feat_card = 0.0    # prefetch + gather from the card
         self.t_feat_h2d = 0.0
 
     def summary(self):
         hit = self.feat_hbm_hits / max(self.feat_rows, 1)
-        return (f"HBM hit {hit:.1%} | feature pages {self.feat_pages} | col_idx entries "
-                f"{self.col_entries} pages {self.col_pages} | sample {self.t_sample * 1e3:.0f} ms, "
+        return (f"HBM hit {hit:.1%} | feature pages {self.feat_pages} | indptr entries {self.ptr_entries} "
+                f"pages {self.ptr_pages} | indices entries {self.col_entries} pages {self.col_pages} | "
+                f"sample {self.t_sample * 1e3:.0f} ms, "
                 f"card gather {self.t_feat_card * 1e3:.0f} ms, H2D {self.t_feat_h2d * 1e3:.0f} ms")
 
 
@@ -159,50 +165,82 @@ class TieredFeatures:
 
 # ---------------------------------------------------------------------------------------------
 class TieredGraph:
-    """Graph structure as CSR (rowptr, colind). With a symmetric graph CSR equals CSC, the
-    in-neighbor format DGL/GIDS sample from.
+    """Graph structure as CSC: indptr (N+1) and indices (E). The list of node v,
+    indices[indptr[v]:indptr[v+1]], holds v's in-neighbors, the nodes that send messages to v
+    (prepare_ogbn.py --format csc). A symmetric graph gives the same arrays as CSR.
 
-    colind_on="host" (default, same placement as GIDS): colind in pinned host DRAM.
-    colind_on="card": colind on the device; only the sampled entries are read, with page prefetch.
-    rowptr is kept on the GPU for degree lookups in both cases.
+    graph_on="card"  (default) indptr and indices both on the device (CXL cache + SSD).
+                     Each hop reads indptr[v], indptr[v+1] for the frontier, then only the
+                     sampled indices entries; both with page prefetch.
+    graph_on="split" indptr in GPU HBM, indices on the device.
+    graph_on="host"  both in pinned host DRAM, the GIDS placement (baseline).
     """
 
-    def __init__(self, rowptr_path, colind_path, device, prefetch=True, stats=None, colind_on="host"):
-        if colind_on not in ("host", "card"):
-            raise ValueError(colind_on)
+    PLACEMENTS = ("card", "split", "host")
+
+    def __init__(self, indptr_path, indices_path, device, prefetch=True, stats=None, graph_on="card"):
+        if graph_on not in self.PLACEMENTS:
+            raise ValueError(graph_on)
         self.device = device
         self.prefetch = prefetch
         self.stats = stats or Stats()
-        self.colind_on = colind_on
-        self.rowptr = torch.from_numpy(np.load(rowptr_path)).to(device=device, dtype=torch.int64)
-        self.num_nodes = self.rowptr.numel() - 1
-        if colind_on == "card":
-            self.colind = im.load_npy(colind_path)
-            self.colind_t = torch.from_numpy(self.colind)
+        self.graph_on = graph_on
+        self.indptr_path = indptr_path
+        self.indptr = self.indptr_t = self.indptr_gpu = None
+        if graph_on == "card":
+            self.indptr = im.load_npy(indptr_path)
+            self.indptr_t = torch.from_numpy(self.indptr)
+        elif graph_on == "split":
+            self.indptr_gpu = torch.from_numpy(np.load(indptr_path)).to(device=device, dtype=torch.int64)
         else:
-            self.colind = None
-            self.colind_t = _pin(torch.from_numpy(np.load(colind_path)))
+            self.indptr_t = _pin(torch.from_numpy(np.load(indptr_path)))
+        if graph_on == "host":
+            self.indices = None
+            self.indices_t = _pin(torch.from_numpy(np.load(indices_path)))
+        else:
+            self.indices = im.load_npy(indices_path)
+            self.indices_t = torch.from_numpy(self.indices)
+        self.num_nodes = int(np.load(indptr_path, mmap_mode="r").shape[0]) - 1
         self._g2l = torch.full((self.num_nodes,), -1, dtype=torch.int64, device=device)
 
     def degree(self):
-        return self.rowptr[1:] - self.rowptr[:-1]
+        """In-degree of every node, on the CPU (read from the indptr file)."""
+        p = torch.from_numpy(np.load(self.indptr_path).astype(np.int64, copy=False))
+        return p[1:] - p[:-1]
 
-    def _read_colind(self, eidx):
-        """eidx: int64 CUDA tensor of edge offsets. Returns colind[eidx] on the GPU."""
+    def _read(self, dev_arr, t, idx, kind):
+        """t[idx] on the GPU. dev_arr is the device-resident numpy array (None = host memory)."""
         st = self.stats
-        uniq, inv = torch.unique(eidx, sorted=True, return_inverse=True)
+        uniq, inv = torch.unique(idx, sorted=True, return_inverse=True)
         uniq_cpu = uniq.cpu()
-        if self.colind_on == "card" and self.prefetch:
-            st.col_pages += im.prefetch_rows(self.colind, uniq_cpu.numpy())
-        vals = _pin(self.colind_t.index_select(0, uniq_cpu)).to(self.device, non_blocking=True)
-        st.col_entries += uniq_cpu.numel()
+        if dev_arr is not None and self.prefetch:
+            pages = im.prefetch_rows(dev_arr, uniq_cpu.numpy())
+            if kind == "indptr":
+                st.ptr_pages += pages
+            else:
+                st.col_pages += pages
+        vals = _pin(t.index_select(0, uniq_cpu)).to(self.device, non_blocking=True)
+        if kind == "indptr":
+            st.ptr_entries += uniq_cpu.numel()
+        else:
+            st.col_entries += uniq_cpu.numel()
         return vals.to(torch.int64)[inv]
 
+    def _ranges(self, frontier):
+        """(start, degree) of each frontier node's list."""
+        if self.graph_on == "split":
+            start = self.indptr_gpu[frontier]
+            return start, self.indptr_gpu[frontier + 1] - start
+        both = self._read(self.indptr if self.graph_on == "card" else None, self.indptr_t,
+                          torch.cat((frontier, frontier + 1)), "indptr")
+        start, end = both[: frontier.numel()], both[frontier.numel():]
+        return start, end - start
+
     def sample(self, seeds, fanouts, generator=None):
-        """Layer-wise uniform neighbor sampling (with replacement when degree > fanout).
+        """Layer-wise uniform in-neighbor sampling (with replacement when degree > fanout).
 
         Returns (n_id, edge_index): n_id are global ids with the seeds first; edge_index is
-        (2, E) in local ids, row 0 = neighbor (source of the message), row 1 = target, which is
+        (2, E) in local ids, row 0 = in-neighbor (source of the message), row 1 = target, which is
         the PyG convention for message passing toward the seeds.
         """
         t0 = time.perf_counter()
@@ -214,16 +252,15 @@ class TieredGraph:
         for fanout in fanouts:
             if frontier.numel() == 0:
                 break
-            start = self.rowptr[frontier]
-            deg = self.rowptr[frontier + 1] - start
+            start, deg = self._ranges(frontier)
             j = torch.arange(fanout, device=dev).expand(frontier.numel(), fanout)
             take_all = (deg <= fanout).unsqueeze(1)
             rnd = torch.rand((frontier.numel(), fanout), device=dev, generator=generator)
             offs = torch.where(take_all, j, (rnd * deg.unsqueeze(1)).long())
             valid = j < torch.clamp(deg, max=fanout).unsqueeze(1)
-            eidx = (start.unsqueeze(1) + offs)[valid]                       # edges to read
+            eidx = (start.unsqueeze(1) + offs)[valid]                       # entries to read
             tgt = frontier.unsqueeze(1).expand(-1, fanout)[valid]
-            nbr = self._read_colind(eidx)                                   # col_idx from the card
+            nbr = self._read(self.indices, self.indices_t, eidx, "indices") if eidx.numel() else eidx
             src_all.append(nbr)
             dst_all.append(tgt)
             seen = torch.cat(visited)
@@ -244,9 +281,18 @@ class TieredGraph:
         return n_id, edge_index
 
 
+def graph_files(data_dir):
+    """(indptr path, indices path) in data_dir: indptr.npy/indices.npy, or the older
+    rowptr.npy/colind.npy names."""
+    for a, b in (("indptr.npy", "indices.npy"), ("rowptr.npy", "colind.npy")):
+        if os.path.exists(os.path.join(data_dir, a)):
+            return os.path.join(data_dir, a), os.path.join(data_dir, b)
+    raise FileNotFoundError(f"no indptr.npy / rowptr.npy in {data_dir}")
+
+
 def hot_by_degree(graph, hbm_bytes, row_bytes):
     """Pick the highest-degree nodes that fit in hbm_bytes (a common static cache policy)."""
     k = min(int(hbm_bytes // row_bytes), graph.num_nodes)
     if k <= 0:
         return torch.empty(0, dtype=torch.int64)
-    return torch.topk(graph.degree(), k).indices.cpu()
+    return torch.topk(graph.degree(), k).indices

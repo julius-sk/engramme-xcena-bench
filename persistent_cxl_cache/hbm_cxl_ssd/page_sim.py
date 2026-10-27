@@ -15,18 +15,20 @@ replays real sampled batches and reports, for each ordering and page size:
     a direct LRU simulation in tests/test_page_sim.py;
   * the smallest cache that keeps SSD reads under --target-mb per batch.
 
-Layout model: the hottest feature rows (--hbm-gb, by degree) are in GPU HBM. The feature table
-is on the storage tier, stored in the given node ORDER (row of node v at position pos[v]). The
-graph structure is in host memory, as in GIDS (--colind-on host, default); with --colind-on card
-col_idx (int64) is on the device too, each adjacency list at its position in the reordered CSR,
-and feature pages and col_idx pages share one LRU cache.
+Layout model: the hottest feature rows (--hbm-gb, by degree) are in GPU HBM. Everything else is
+on the device, stored in the given node ORDER: feature row of node v at position pos[v]; the
+CSC graph (int64 indptr and indices) reordered the same way, the in-neighbor list of v at its
+position in the reordered arrays. --graph-on chooses what of the graph is on the device:
+card (default) = indptr and indices, split = indices only (indptr in HBM), host = none (GIDS).
+All device pages share one LRU cache.
 
     python page_sim.py --data DIR --orders original,degree,random,rcm --batching random
-    python page_sim.py --data DIR --orders original --colind-on card       # col_idx on the device too
+    python page_sim.py --data DIR --orders original --graph-on host        # GIDS placement: features only
     python page_sim.py --data DIR --orders original --batching contiguous   # partition-like batches
     python page_sim.py --data DIR --orders file --perm my_order.npy        # e.g. a METIS order
 
-DIR holds rowptr.npy, colind.npy, feat.npy (only its shape/dtype is read), optional train_idx.npy
+DIR holds indptr.npy, indices.npy (CSC; rowptr.npy/colind.npy also accepted), feat.npy (only its
+shape/dtype is read), optional train_idx.npy
 (prepare_ogbn.py writes this layout). Sampling: uniform, with replacement when degree > fanout,
 same as tiered_store.TieredGraph.sample.
 """
@@ -36,21 +38,30 @@ import time
 
 import numpy as np
 
+def graph_files(data_dir):
+    for a, b in (("indptr.npy", "indices.npy"), ("rowptr.npy", "colind.npy")):
+        if os.path.exists(os.path.join(data_dir, a)):
+            return os.path.join(data_dir, a), os.path.join(data_dir, b)
+    raise FileNotFoundError(f"no indptr.npy / rowptr.npy in {data_dir}")
+
+
 PAGE_SIZES = {"512K": 512 * 1024, "64K": 64 * 1024, "4K": 4 * 1024}
 
 
 # ---------------------------------------------------------------------------------------------
 # sampling (original node ids)
 def sample_batch(rowptr, colind, seeds, fanouts, rng, mark):
-    """Returns (n_id, edge_targets, edge_offsets): all nodes whose features are needed, and for
-    every col_idx entry read, the node whose list it belongs to and its offset in that list."""
+    """Returns (n_id, expanded, edge_targets, edge_offsets): all nodes whose features are needed,
+    the nodes whose indptr entries were read, and for every indices entry read, the node whose
+    list it belongs to and its offset in that list."""
     frontier = seeds
     visited = [seeds]
     mark[seeds] = 1
-    tg_all, off_all = [], []
+    tg_all, off_all, exp_all = [], [], []
     for k in fanouts:
         if frontier.size == 0:
             break
+        exp_all.append(frontier)
         start = rowptr[frontier]
         deg = rowptr[frontier + 1] - start
         cnt = np.minimum(deg, k)
@@ -73,7 +84,7 @@ def sample_batch(rowptr, colind, seeds, fanouts, rng, mark):
     n_id = np.concatenate(visited)
     mark[n_id] = 0
     cat = (lambda a: np.concatenate(a) if a else np.empty(0, np.int64))
-    return n_id, cat(tg_all), cat(off_all)
+    return n_id, cat(exp_all), cat(tg_all), cat(off_all)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -134,8 +145,9 @@ def misses_for(dists, cache_pages):
 # ---------------------------------------------------------------------------------------------
 def run(args):
     t0 = time.time()
-    rowptr = np.load(os.path.join(args.data, "rowptr.npy"))
-    colind = np.load(os.path.join(args.data, "colind.npy"), mmap_mode="r")
+    ip_path, ix_path = graph_files(args.data)
+    rowptr = np.load(ip_path)                       # CSC indptr
+    colind = np.load(ix_path, mmap_mode="r")        # CSC indices
     fmeta = np.load(os.path.join(args.data, "feat.npy"), mmap_mode="r")
     n, dim = fmeta.shape
     row_bytes = args.feat_bytes or dim * fmeta.dtype.itemsize
@@ -149,6 +161,7 @@ def run(args):
         in_hbm[np.argpartition(-deg, hot_k - 1)[:hot_k]] = True
     feat_bytes_total = n * row_bytes
     col_bytes_total = colind.size * 8
+    ptr_bytes_total = rowptr.size * 8
     print(f"N={n} E={colind.size} row={row_bytes} B  features {feat_bytes_total / 2**30:.2f} GiB, "
           f"col_idx {col_bytes_total / 2**30:.2f} GiB, HBM rows {hot_k} ({hot_k / n:.1%})  "
           f"[{time.time() - t0:.0f} s]", flush=True)
@@ -181,22 +194,25 @@ def run(args):
         for b in range(total):
             lo = (b % nfull) * args.batch
             seeds = np.unique(seeds_all[lo:lo + args.batch])
-            n_id, tgt, off = sample_batch(rowptr, colind, seeds, fanouts, rng, mark)
+            n_id, expd, tgt, off = sample_batch(rowptr, colind, seeds, fanouts, rng, mark)
             fn = n_id[~in_hbm[n_id]]
             fpos = pos[fn] * row_bytes
-            cpos = (new_start[tgt] + off) * 8 if args.colind_on == "card" else np.empty(0, np.int64)
-            batches.append((fpos, cpos, fn.size * row_bytes + cpos.size * 8))
+            none = np.empty(0, np.int64)
+            cpos = (new_start[tgt] + off) * 8 if args.graph_on in ("card", "split") else none
+            ppos = np.concatenate((pos[expd], pos[expd] + 1)) * 8 if args.graph_on == "card" else none
+            batches.append((fpos, ppos, cpos, fn.size * row_bytes + (ppos.size + cpos.size) * 8))
         print(f"[{oname}] sampled {total} batches [{time.time() - t1:.0f} s]", flush=True)
 
         for pname in args.pages.split(","):
             page = PAGE_SIZES[pname]
             pf = -(-feat_bytes_total // page)
-            pc = -(-col_bytes_total // page) if args.colind_on == "card" else 0
-            sd = StackDistance(pf + pc)
+            pc = -(-col_bytes_total // page) if args.graph_on in ("card", "split") else 0
+            pp = -(-ptr_bytes_total // page) if args.graph_on == "card" else 0
+            sd = StackDistance(pf + pc + pp)
             dists, fpg, cpg, useful = [], [], [], []
-            for b, (fpos, cpos, use) in enumerate(batches):
+            for b, (fpos, ppos, cpos, use) in enumerate(batches):
                 fp = np.unique(np.concatenate((fpos // page, (fpos + row_bytes - 1) // page)))
-                cp = np.unique(cpos // page) + pf
+                cp = np.unique(np.concatenate((cpos // page + pf, ppos // page + pf + pc)))
                 d = sd.access(np.concatenate((fp, cp)))
                 if b >= args.warmup:
                     dists.append(d)
@@ -212,7 +228,7 @@ def run(args):
             grid = np.unique(np.geomspace(1, pf + pc, 400).astype(np.int64))
             miss_grid = misses_for(dists, grid) * page / nb / 1e6
             ok = np.nonzero(miss_grid <= args.target_mb)[0]
-            need = f"{grid[ok[0]] * page / 2**30:.2f} GiB" if ok.size else "> whole dataset"
+            need = f"{grid[ok[0]] * page / 2**30:.2f} GiB" if ok.size else "never (first touches alone exceed it)"
             rows.append((oname, pname, np.mean(fpg), np.mean(cpg), touched / 1e6, np.mean(useful) / 1e6,
                          touched / max(np.mean(useful), 1), ssd_mb, need))
 
@@ -245,8 +261,8 @@ def main():
     p.add_argument("--perm", help="order .npy for --orders file (order[i] = node at position i)")
     p.add_argument("--batching", choices=["random", "contiguous"], default="random")
     p.add_argument("--pages", default="4K,64K,512K", help="4K = BaM/GIDS cache-line granularity")
-    p.add_argument("--colind-on", choices=["host", "card"], default="host",
-                   help="host = graph structure in host memory, as GIDS (only features hit the device)")
+    p.add_argument("--graph-on", choices=["card", "split", "host"], default="card",
+                   help="card = indptr+indices on the device; split = indices only; host = GIDS (features only)")
     p.add_argument("--fanouts", default="10,10,10")
     p.add_argument("--batch", type=int, default=1024)
     p.add_argument("--batches", type=int, default=200)

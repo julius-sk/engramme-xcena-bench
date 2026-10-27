@@ -34,8 +34,10 @@ d = tempfile.mkdtemp()
 for k, v in dict(rowptr=rowptr, colind=colind, feat=feat).items(): np.save(f"{d}/{k}.npy", v)
 
 dev = torch.device("cpu"); st = Stats()
-g_card = TieredGraph(f"{d}/rowptr.npy", f"{d}/colind.npy", dev, stats=Stats(), colind_on="card")
-g = TieredGraph(f"{d}/rowptr.npy", f"{d}/colind.npy", dev, stats=st)   # host, as GIDS
+graphs = {on: TieredGraph(f"{d}/rowptr.npy", f"{d}/colind.npy", dev, stats=Stats(), graph_on=on)
+          for on in TieredGraph.PLACEMENTS}
+g = graphs["card"]
+g.stats = st
 hot = hot_by_degree(g, 300 * D * 4, D * 4); assert hot.numel() == 300
 f = TieredFeatures(f"{d}/feat.npy", dev, hot_ids=hot, stats=st)
 
@@ -49,7 +51,7 @@ assert st.feat_hbm_hits == hits, (st.feat_hbm_hits, hits)
 nbrs = [set(colind[rowptr[v]:rowptr[v+1]]) for v in range(N)]
 fan = [5, 4, 3]
 for trial in range(20):
-    gs = g_card if trial % 2 else g
+    gs = graphs[TieredGraph.PLACEMENTS[trial % 3]]
     seeds = torch.from_numpy(rng.choice(N, 64, replace=False)).long()
     n_id, ei = gs.sample(seeds, fan)
     assert torch.equal(n_id[:64], seeds)
@@ -64,4 +66,11 @@ for trial in range(20):
     for t_ in seeds.numpy():
         exp = min(len(colind[rowptr[t_]:rowptr[t_+1]]), fan[0])
         assert c.get(int(t_), 0) == exp, (t_, c.get(int(t_)), exp)
-print("OK  gather + sampling correct;", st.summary())
+assert graphs["card"].stats.ptr_entries > 0 and graphs["split"].stats.ptr_entries == 0
+
+# CSC conversion: indices[indptr[v]:indptr[v+1]] = in-neighbors of v
+from prepare_ogbn import to_csc
+src = np.array([0, 0, 1, 2, 3, 3]); dst = np.array([1, 2, 2, 0, 0, 2])
+ip, ix = to_csc(src, dst, 4)
+assert [sorted(ix[ip[v]:ip[v + 1]].tolist()) for v in range(4)] == [[2, 3], [0], [0, 1, 3], []]
+print("OK  gather + sampling correct (card/split/host), CSC conversion correct;", st.summary())
