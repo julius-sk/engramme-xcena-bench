@@ -3,6 +3,7 @@
     python bench_tiered.py --data /mnt/data/ogbn_products_csr --hbm-gb 0.2 --batches 50
     python bench_tiered.py --data ... --hbm-gb 0 --no-prefetch          # ablation
     python bench_tiered.py --data ... --train                            # 3-layer SAGE (needs PyG)
+    python bench_tiered.py --data ... --colind-on card                   # graph structure on the device too
 
 --data must hold rowptr.npy (int64, N+1), colind.npy (int64, E), feat.npy (N, D), and optionally
 labels.npy (N,) and train_idx.npy. prepare_ogbn.py writes this layout.
@@ -31,6 +32,8 @@ def main():
     p.add_argument("--batches", type=int, default=50)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--no-prefetch", action="store_true")
+    p.add_argument("--colind-on", choices=["host", "card"], default="host",
+                   help="graph structure placement; host = same as GIDS")
     p.add_argument("--train", action="store_true", help="also run a 3-layer GraphSAGE step")
     args = p.parse_args()
 
@@ -41,15 +44,16 @@ def main():
     stats = Stats()
     prefetch = not args.no_prefetch
 
-    print("[load] col_idx and features -> card (CXL cache + SSD); row_ptr -> HBM", flush=True)
+    print(f"[load] features -> device (CXL cache + SSD); col_idx -> {args.colind_on}; row_ptr -> HBM",
+          flush=True)
     graph = TieredGraph(os.path.join(args.data, "rowptr.npy"), os.path.join(args.data, "colind.npy"),
-                        dev, prefetch=prefetch, stats=stats)
+                        dev, prefetch=prefetch, stats=stats, colind_on=args.colind_on)
     feat_path = os.path.join(args.data, "feat.npy")
     fmeta = np.load(feat_path, mmap_mode="r")
     row_bytes = fmeta.shape[1] * fmeta.dtype.itemsize
     hot = hot_by_degree(graph, args.hbm_gb * (1 << 30), row_bytes)
     feats = TieredFeatures(feat_path, dev, hot_ids=hot, prefetch=prefetch, stats=stats)
-    print(f"[load] N={graph.num_nodes} E={graph.colind.shape[0]} D={feats.dim} "
+    print(f"[load] N={graph.num_nodes} E={graph.colind_t.shape[0]} D={feats.dim} "
           f"HBM cache {hot.numel()} rows ({hot.numel() / graph.num_nodes:.1%} of nodes)", flush=True)
 
     tpath = os.path.join(args.data, "train_idx.npy")

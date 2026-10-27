@@ -1,7 +1,8 @@
 """page_sim.py - how big must the CXL cache be? Offline page-level simulation, no card needed.
 
 A CXL memory device that caches an SSD (e.g. XCENA InfiniteMemory) moves whole pages (512 KB on
-MX1P; 64 KB announced). For GNN mini-batch training what matters is how many DISTINCT pages a
+MX1P; 64 KB announced). BaM/GIDS read the SSD in 4 KB cache lines, so the 4K page size models
+that granularity for comparison. For GNN mini-batch training what matters is how many DISTINCT pages a
 batch touches, and how many of those are still cached from earlier batches. Both depend on how
 node ids are laid out in memory (the ordering) and on how batches are formed. This script
 replays real sampled batches and reports, for each ordering and page size:
@@ -14,12 +15,14 @@ replays real sampled batches and reports, for each ordering and page size:
     a direct LRU simulation in tests/test_page_sim.py;
   * the smallest cache that keeps SSD reads under --target-mb per batch.
 
-Layout model: row_ptr and the hottest feature rows (--hbm-gb, by degree) are in GPU HBM. col_idx
-(int64) and the feature table are on the device, stored in the given node ORDER: feature row of
-node v at position pos[v]; the adjacency list of v at its position in the reordered CSR, with
-the neighbor order inside a list unchanged. Feature pages and col_idx pages share one LRU cache.
+Layout model: the hottest feature rows (--hbm-gb, by degree) are in GPU HBM. The feature table
+is on the storage tier, stored in the given node ORDER (row of node v at position pos[v]). The
+graph structure is in host memory, as in GIDS (--colind-on host, default); with --colind-on card
+col_idx (int64) is on the device too, each adjacency list at its position in the reordered CSR,
+and feature pages and col_idx pages share one LRU cache.
 
     python page_sim.py --data DIR --orders original,degree,random,rcm --batching random
+    python page_sim.py --data DIR --orders original --colind-on card       # col_idx on the device too
     python page_sim.py --data DIR --orders original --batching contiguous   # partition-like batches
     python page_sim.py --data DIR --orders file --perm my_order.npy        # e.g. a METIS order
 
@@ -33,7 +36,7 @@ import time
 
 import numpy as np
 
-PAGE_SIZES = {"512K": 512 * 1024, "64K": 64 * 1024}
+PAGE_SIZES = {"512K": 512 * 1024, "64K": 64 * 1024, "4K": 4 * 1024}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -181,14 +184,14 @@ def run(args):
             n_id, tgt, off = sample_batch(rowptr, colind, seeds, fanouts, rng, mark)
             fn = n_id[~in_hbm[n_id]]
             fpos = pos[fn] * row_bytes
-            cpos = (new_start[tgt] + off) * 8
+            cpos = (new_start[tgt] + off) * 8 if args.colind_on == "card" else np.empty(0, np.int64)
             batches.append((fpos, cpos, fn.size * row_bytes + cpos.size * 8))
         print(f"[{oname}] sampled {total} batches [{time.time() - t1:.0f} s]", flush=True)
 
         for pname in args.pages.split(","):
             page = PAGE_SIZES[pname]
             pf = -(-feat_bytes_total // page)
-            pc = -(-col_bytes_total // page)
+            pc = -(-col_bytes_total // page) if args.colind_on == "card" else 0
             sd = StackDistance(pf + pc)
             dists, fpg, cpg, useful = [], [], [], []
             for b, (fpos, cpos, use) in enumerate(batches):
@@ -241,7 +244,9 @@ def main():
     p.add_argument("--orders", default="original,degree,random")
     p.add_argument("--perm", help="order .npy for --orders file (order[i] = node at position i)")
     p.add_argument("--batching", choices=["random", "contiguous"], default="random")
-    p.add_argument("--pages", default="512K,64K")
+    p.add_argument("--pages", default="4K,64K,512K", help="4K = BaM/GIDS cache-line granularity")
+    p.add_argument("--colind-on", choices=["host", "card"], default="host",
+                   help="host = graph structure in host memory, as GIDS (only features hit the device)")
     p.add_argument("--fanouts", default="10,10,10")
     p.add_argument("--batch", type=int, default=1024)
     p.add_argument("--batches", type=int, default=200)

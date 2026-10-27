@@ -34,7 +34,8 @@ d = tempfile.mkdtemp()
 for k, v in dict(rowptr=rowptr, colind=colind, feat=feat).items(): np.save(f"{d}/{k}.npy", v)
 
 dev = torch.device("cpu"); st = Stats()
-g = TieredGraph(f"{d}/rowptr.npy", f"{d}/colind.npy", dev, stats=st)
+g_card = TieredGraph(f"{d}/rowptr.npy", f"{d}/colind.npy", dev, stats=Stats(), colind_on="card")
+g = TieredGraph(f"{d}/rowptr.npy", f"{d}/colind.npy", dev, stats=st)   # host, as GIDS
 hot = hot_by_degree(g, 300 * D * 4, D * 4); assert hot.numel() == 300
 f = TieredFeatures(f"{d}/feat.npy", dev, hot_ids=hot, stats=st)
 
@@ -48,8 +49,9 @@ assert st.feat_hbm_hits == hits, (st.feat_hbm_hits, hits)
 nbrs = [set(colind[rowptr[v]:rowptr[v+1]]) for v in range(N)]
 fan = [5, 4, 3]
 for trial in range(20):
+    gs = g_card if trial % 2 else g
     seeds = torch.from_numpy(rng.choice(N, 64, replace=False)).long()
-    n_id, ei = g.sample(seeds, fan)
+    n_id, ei = gs.sample(seeds, fan)
     assert torch.equal(n_id[:64], seeds)
     assert n_id.unique().numel() == n_id.numel(), "n_id not unique"
     assert (ei >= 0).all() and (ei < n_id.numel()).all()

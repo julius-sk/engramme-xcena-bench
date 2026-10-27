@@ -1,46 +1,51 @@
-# persistent_cxl_cache: GNN data on GPU HBM + a CXL DRAM cache + SSD
+# persistent_cxl_cache: GNN features on GPU HBM + a CXL DRAM cache + SSD
 
-Example code for GNN mini-batch training where the graph and feature table live in an
-SSD-backed CXL memory device (XCENA MX1P with InfiniteMemory). The device's DRAM acts as a
-hardware-managed cache in front of its SSD, and the GPU keeps the hottest data in HBM.
+Example code for out-of-memory GNN training, where the node feature table sits on an
+SSD-backed CXL memory device (XCENA MX1P with InfiniteMemory). The method is meant to be
+compared with **BaM** and **GIDS**, which read the feature table straight from the SSD with
+GPU-initiated I/O.
 
 **Status:** the code is checked on the CPU with a fake device (`tests/`). It has not yet been
 run on a card, so it comes with no performance numbers.
 
-## The three tiers
+## Same setup as GIDS, different feature path
 
-| Tier | What it holds | Managed by |
+GIDS keeps the graph structure pinned in host memory and puts only the feature table on
+storage. This code does the same by default, so the feature path is the only difference.
+
+| | GIDS (BaM) | This method |
 | --- | --- | --- |
-| GPU HBM | `row_ptr`; feature rows of the highest-degree nodes (static cache) | software |
-| CXL cache | the device DRAM (InfiniteMemory "Cache Region") | device hardware, 512 KB pages |
-| SSD | the full `col_idx` and feature table, behind the device DRAM | device hardware |
+| Graph structure | pinned host memory, GPU sampling | pinned host memory (`--colind-on host`, default); optional `--colind-on card` |
+| Feature table | NVMe SSD, read by GPU threads through BaM | the CXL device: device DRAM caches its SSD in hardware |
+| Read granularity | 4 KB cache lines | 512 KB device pages on MX1P (64 KB announced) |
+| GPU-side cache | BaM software cache with window buffering (look-ahead eviction) | static HBM cache of the highest-degree rows |
+| Hot-node buffer | constant CPU buffer (hot nodes pinned in host DRAM) | the device DRAM cache (hardware-managed) |
+| Who issues I/O | GPU threads, many concurrent SSD requests | host CPU: one async prefetch per distinct page, then a gather |
 
-To the host, the CXL cache and the SSD form one flat address space. Software decides how
-requests reach that space:
+The feature path for each batch:
 
-1. **Sample on the GPU.** Degrees and edge ranges come from `row_ptr` in HBM. Only the
-   selected `col_idx` entries are read from the device.
-2. **Reduce requests.** Drop HBM hits, deduplicate, and sort by address.
-3. **Prefetch.** Issue one asynchronous `prefetchMemory` per distinct page, so the SSD reads
-   overlap.
-4. **Gather.** `index_select` from the device into pinned host memory, then copy to the GPU
-   and scatter back into batch order.
+1. **Reduce requests on the GPU.** Drop HBM hits, deduplicate, and sort by address.
+2. **Prefetch.** Issue one asynchronous `prefetchMemory` per distinct device page, so the SSD
+   reads overlap.
+3. **Gather.** `index_select` from the device into pinned host memory.
+4. **H2D and scatter.** Copy to the GPU and put the rows back in batch order.
 
-## How big must the CXL cache be?
+The graph is stored as CSR (`rowptr`, `colind`). `prepare_ogbn.py` makes the graph symmetric,
+so CSR equals CSC, the in-neighbor format that DGL and GIDS sample from.
 
-That depends on how many distinct pages a batch touches, and that depends on the node
-ordering and on how batches are formed. For example, with 512 B feature rows and a 512 KB
-page, one page holds 1024 rows. A random-order batch that samples tens of thousands of nodes
-touches most pages of the table. The cache then has to hold nearly the whole table, or every
-batch reads gigabytes from the SSD.
+## Page granularity is the main question
 
-`page_sim.py` answers the question offline, without a card. It replays real sampled batches
-under each ordering (`original`, `degree`, `random`, `rcm`, or your own permutation with
-`--orders file --perm`) and each page size (512 KB, and 64 KB announced). For each
-combination it reports:
+The device moves whole pages. A 512 B feature row (128 × fp32) read through a 512 KB page
+costs 1024× the bytes it uses. BaM's 4 KB lines cost 8×. Unless node ordering and batch
+construction put the rows a batch needs on the same pages, the device tier reads far more
+from the SSD than BaM does.
 
-- feature and `col_idx` pages touched per batch, and the read amplification (bytes moved /
-  bytes used);
+`page_sim.py` measures this offline, without a card or SSD. It replays real sampled batches
+under each node ordering (`original`, `degree`, `random`, `rcm`, or your own permutation with
+`--orders file --perm`) and each page size (`4K` = BaM, `64K`, `512K`). For each combination
+it reports:
+
+- pages touched per batch, and the read amplification (bytes moved / bytes used);
 - SSD MB per batch at each cache size, from exact LRU stack distances (one pass gives the
   whole miss-ratio curve);
 - the smallest cache that keeps SSD reads under `--target-mb` per batch.
@@ -55,10 +60,10 @@ access misses.
 | --- | --- |
 | `im_loader/im_store.cpp` | Small C API over libpxl: init, alloc/free, flush, commit, prefetch (batched by page), pin, preload/unload |
 | `im_loader/im_store.py` | ctypes wrapper. `load_npy` copies a `.npy` file into device memory and returns a zero-copy numpy array |
-| `hbm_cxl_ssd/tiered_store.py` | `TieredGraph` (sampling), `TieredFeatures` (gather), `SsdCounter` (device SSD byte counters) |
+| `hbm_cxl_ssd/tiered_store.py` | `TieredGraph` (sampling; col_idx on host or device), `TieredFeatures` (HBM → device gather), `SsdCounter` (device SSD byte counters) |
 | `hbm_cxl_ssd/bench_tiered.py` | Mini-batch loop. Reports time per stage, HBM hit rate, pages touched and SSD bytes. Optional 3-layer GraphSAGE (`--train`) |
-| `hbm_cxl_ssd/page_sim.py` | Offline cache-size and ordering simulation |
-| `hbm_cxl_ssd/prepare_ogbn.py` | OGB node dataset → `rowptr.npy`, `colind.npy`, `feat.npy`, `labels.npy`, `train_idx.npy` |
+| `hbm_cxl_ssd/page_sim.py` | Offline page-granularity, ordering and cache-size simulation (4K / 64K / 512K) |
+| `hbm_cxl_ssd/prepare_ogbn.py` | OGB node dataset → `rowptr.npy`, `colind.npy`, `feat.npy`, `labels.npy`, `train_idx.npy` (`--fp16` halves features) |
 | `hbm_cxl_ssd/tests/` | CPU tests: fake device for `tiered_store`; stack distance vs direct LRU for `page_sim` |
 
 See also `../dran_mu/im_examples.cpp` for basic InfiniteMemory usage from C++.
@@ -82,6 +87,10 @@ python bench_tiered.py --data ~/csr_products --hbm-gb 0.2
 python bench_tiered.py --data ~/csr_products --hbm-gb 0 --no-prefetch   # ablation
 ```
 
+For the BaM/GIDS side, use the same dataset files, batch size, fanouts and GPU. Run GIDS's own
+dataloader with the feature table on a dedicated NVMe SSD: BaM takes the SSD over from the
+kernel NVMe driver, so it cannot be a disk the system is using.
+
 ## Things to know about InfiniteMemory (measured on MX1P)
 
 - **Data lives only as long as the process.** Releasing memory, including at process exit,
@@ -93,16 +102,16 @@ python bench_tiered.py --data ~/csr_products --hbm-gb 0 --no-prefetch   # ablati
   for everyone.
 - **Writes to never-cached pages first read them from the SSD** (write-allocate). Loading
   measured 1.4–2.4 GB/s.
-- **Small datasets never reach the SSD.** ogbn-products (about 2 GB) stays in the device DRAM
-  even at the 4 GB minimum cache. Use a larger dataset (for example ogbn-papers100M with fp16
-  features) to exercise the SSD tier.
+- **Small datasets never reach the SSD.** ogbn-products (about 1 GB of features) stays in the
+  device DRAM even at the 4 GB minimum cache. Use ogbn-papers100M (`--fp16`, about 28 GB of
+  features) or larger to exercise the SSD tier.
 - **This code reads the device from the host CPU, not from the GPU.** A GPU load that misses to
   the SSD would wait about 100 µs or more, and that is untested.
 
 ## Not done yet
 
-- A look-ahead cache policy over a window of future batches.
+- A look-ahead cache policy for the HBM tier (the counterpart of GIDS window buffering).
 - Overlapping batch *i+1*'s gather with batch *i*'s compute.
 - Sampling without replacement (the current sampler takes neighbors with replacement when
-  degree > fanout).
+  degree > fanout; DGL samples without replacement by default).
 - Multi-GPU.

@@ -1,28 +1,23 @@
-"""tiered_store.py - GNN data on three tiers: GPU HBM -> CXL DRAM cache -> SSD.
+"""tiered_store.py - GNN feature table on GPU HBM -> CXL DRAM cache -> SSD.
 
-The three tiers map onto the hardware like this:
+Built to be compared with BaM / GIDS, so it uses the same split as GIDS:
 
-    HBM        GPU memory. Holds row_ptr (so degrees and edge ranges are local to the GPU)
-               and a static cache of hot feature rows (highest-degree nodes).
-    CXL cache  The XCENA card's DRAM (the InfiniteMemory "Cache Region"). Hardware-managed:
-               the card keeps recently used 512 KB pages and evicts the rest.
-    SSD        The SSD behind the card. The whole col_idx and feature table live in the card's
-               address space; whatever is not cached is fetched from here by the card.
+    graph structure  pinned host memory (GIDS does the same); sampled on the GPU side.
+                     Optional --colind-on card puts col_idx on the device instead.
+    feature table    the storage tier. GIDS: GPU-initiated reads from the SSD via BaM, with a
+                     GPU software cache and a constant CPU buffer for hot nodes.
+                     Here: the XCENA device - its DRAM caches its SSD in hardware (512 KB pages),
+                     plus a static HBM cache of hot rows.
 
-The CXL cache and the SSD are therefore one flat address space to the host (im_store arrays).
-What the software controls is how requests reach it:
+So the only thing that differs from GIDS is the feature path:
 
-    GPU: sample        row_ptr in HBM -> pick k edge offsets per node on the GPU
-    GPU: reduce        dedupe requested ids/offsets, drop HBM hits, sort by address
-    host: prefetch     issue prefetchMemory once per distinct 512 KB page (async, overlaps SSD reads)
-    host: gather       index_select from the card into a pinned DRAM buffer
+    GPU: reduce        drop HBM hits, dedupe, sort by address
+    host: prefetch     prefetchMemory once per distinct device page (async, overlaps SSD reads)
+    host: gather       index_select from the device into a pinned DRAM buffer
     GPU: H2D + scatter copy the rows to the GPU and put them in batch order
 
-In other words: GPU-side request reduction plus device-side page merging, with the CXL-side
-cache itself provided by the device hardware rather than by software.
-
-Not here yet (next steps): a look-ahead cache policy (Value(p) over a window of W mini-batches),
-GPU zero-copy reads of the card (see README), overlap of batch i+1's gather with batch i's compute.
+Not here yet: a look-ahead cache policy (GIDS's window buffering is the counterpart), GPU
+zero-copy reads of the device, overlap of batch i+1's gather with batch i's compute.
 """
 import os
 import subprocess
@@ -164,16 +159,29 @@ class TieredFeatures:
 
 # ---------------------------------------------------------------------------------------------
 class TieredGraph:
-    """CSR graph: row_ptr in HBM, col_idx on the card. Only the sampled col_idx entries are read."""
+    """Graph structure as CSR (rowptr, colind). With a symmetric graph CSR equals CSC, the
+    in-neighbor format DGL/GIDS sample from.
 
-    def __init__(self, rowptr_path, colind_path, device, prefetch=True, stats=None):
+    colind_on="host" (default, same placement as GIDS): colind in pinned host DRAM.
+    colind_on="card": colind on the device; only the sampled entries are read, with page prefetch.
+    rowptr is kept on the GPU for degree lookups in both cases.
+    """
+
+    def __init__(self, rowptr_path, colind_path, device, prefetch=True, stats=None, colind_on="host"):
+        if colind_on not in ("host", "card"):
+            raise ValueError(colind_on)
         self.device = device
         self.prefetch = prefetch
         self.stats = stats or Stats()
+        self.colind_on = colind_on
         self.rowptr = torch.from_numpy(np.load(rowptr_path)).to(device=device, dtype=torch.int64)
         self.num_nodes = self.rowptr.numel() - 1
-        self.colind = im.load_npy(colind_path)             # on the card
-        self.colind_t = torch.from_numpy(self.colind)
+        if colind_on == "card":
+            self.colind = im.load_npy(colind_path)
+            self.colind_t = torch.from_numpy(self.colind)
+        else:
+            self.colind = None
+            self.colind_t = _pin(torch.from_numpy(np.load(colind_path)))
         self._g2l = torch.full((self.num_nodes,), -1, dtype=torch.int64, device=device)
 
     def degree(self):
@@ -184,7 +192,7 @@ class TieredGraph:
         st = self.stats
         uniq, inv = torch.unique(eidx, sorted=True, return_inverse=True)
         uniq_cpu = uniq.cpu()
-        if self.prefetch:
+        if self.colind_on == "card" and self.prefetch:
             st.col_pages += im.prefetch_rows(self.colind, uniq_cpu.numpy())
         vals = _pin(self.colind_t.index_select(0, uniq_cpu)).to(self.device, non_blocking=True)
         st.col_entries += uniq_cpu.numel()
