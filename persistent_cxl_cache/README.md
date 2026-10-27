@@ -6,6 +6,8 @@ with InfiniteMemory). The device DRAM caches hot blocks, and its SSD holds the f
 The method is meant to be compared with **BaM** and **GIDS**, which keep the graph in host
 memory and read features from the SSD with GPU-initiated I/O.
 
+**How to use it:** see [USAGE.md](USAGE.md) for setup, the Python API, all command-line flags and how to read the output.
+
 **Status:** the code is checked on the CPU with a fake device (`tests/`). It has not yet been
 run on a card, so it comes with no performance numbers.
 
