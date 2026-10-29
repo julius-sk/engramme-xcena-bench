@@ -60,13 +60,10 @@ inline void topkInsert(float* scores, uint32_t* indices, int k, float score, uin
 //
 // Each task writes its own slice, so no cross-task synchronization is needed.
 // ---------------------------------------------------------------------------
-void dran_scan_topk(const half* keys,
-                    const half* query,
-                    int dim,
-                    uint64_t numCols,
-                    int topK,
-                    float* outScores,
-                    uint32_t* outIndices)
+namespace
+{
+inline void scanTopk(const half* keys, const half* query, int dim, uint64_t numCols, int topK,
+                     float* outScores, uint32_t* outIndices, bool verbose)
 {
     const uint32_t taskIdx = mu::getTaskIdx();
     const uint32_t taskCount = mu::getTaskCount();
@@ -93,7 +90,7 @@ void dran_scan_topk(const half* keys,
         localIndices[i] = 0;
     }
 
-    if (taskIdx == 0)
+    if (verbose && taskIdx == 0)
     {
         mu::hostPrintf("[kernel] taskCount=%u perTask=%u range=[%u,%u)\n",
                        (unsigned)taskCount, (unsigned)perTask,
@@ -110,7 +107,7 @@ void dran_scan_topk(const half* keys,
         const half* kcol = keys + col * vectorDim;
         float acc = 0.0f;
         auto vErr = mu::vector::dotProduct(kcol, query, &acc, vectorDim);
-        if (taskIdx == 0 && col == colBegin)
+        if (verbose && taskIdx == 0 && col == colBegin)
         {
             uint32_t ab = 0;
             __builtin_memcpy(&ab, &acc, 4);
@@ -120,7 +117,7 @@ void dran_scan_topk(const half* keys,
         topkInsert(localScores, localIndices, topK, acc, static_cast<uint32_t>(col));
     }
 
-    if (taskIdx == 0)
+    if (verbose && taskIdx == 0)
     {
         uint32_t sb = 0;
         __builtin_memcpy(&sb, &localScores[0], 4);
@@ -135,6 +132,20 @@ void dran_scan_topk(const half* keys,
         myScores[i] = localScores[i];
         myIndices[i] = localIndices[i];
     }
+}
+}  // namespace
+
+void dran_scan_topk(const half* keys, const half* query, int dim, uint64_t numCols, int topK,
+                    float* outScores, uint32_t* outIndices)
+{
+    scanTopk(keys, query, dim, numCols, topK, outScores, outIndices, true);
+}
+
+// Same scan without the debug prints, for benchmarks that launch it many times.
+void dran_scan_topk_q(const half* keys, const half* query, int dim, uint64_t numCols, int topK,
+                      float* outScores, uint32_t* outIndices)
+{
+    scanTopk(keys, query, dim, numCols, topK, outScores, outIndices, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -291,5 +302,6 @@ void dran_mix_values(const half* values,
 }
 
 MU_KERNEL_ADD(dran_scan_topk);
+MU_KERNEL_ADD(dran_scan_topk_q);
 MU_KERNEL_ADD(dran_merge_feedback);
 MU_KERNEL_ADD(dran_mix_values);

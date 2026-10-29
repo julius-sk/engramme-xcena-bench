@@ -6,6 +6,7 @@ set(src
     dran_retrieve_lanec.cpp
     im_probe.cpp
     im_examples.cpp
+    im_tenant_bench.cpp
 )
 
 set(include

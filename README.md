@@ -42,7 +42,8 @@ movement, not recall quality.
 | `dran_mu/mu_kernel/mu_dran.cpp` | Lane C MU kernel (scan, local top-k, merge, mix) |
 | `dran_mu/dran_retrieve.cpp` | Experimental: `--place dram\|hybrid\|ssd` placement test; needs a card with an SSD tier in Computing mode |
 | `dran_mu/im_probe.cpp` | InfiniteMemory probe: one API call at a time, with status, time, device counter deltas and page-level data checks (`--part ABCD`) |
-| `dran_mu/im_examples.cpp` | Basic InfiniteMemory usage: plain memory, commit, prefetch before sparse reads, pin, preload → MU kernel → unload (`--ex 12345`) |
+| `dran_mu/im_examples.cpp` | Basic InfiniteMemory usage: plain memory, commit, prefetch before sparse reads, pin, preload → MU kernel → unload (`--ex 12345`); `--ex 6` reuses a preloaded slot by overwriting it from the host, without unload write-back |
+| `dran_mu/im_tenant_bench.cpp` | Many users' K/V in InfiniteMemory, a few users' K computable at once; Zipf query stream, LRU swap by host copy into preloaded slots (`--swap copy`) or unload/preload (`--swap preload`); reports hot/cold latency and SSD bytes per swap |
 | `persistent_cxl_cache/` | GNN data on GPU HBM + CXL DRAM cache + SSD: tiered store, mini-batch benchmark, offline cache-size simulator (see its README) |
 | `setup_new_server.sh` | Staged setup of a new host (see below) |
 

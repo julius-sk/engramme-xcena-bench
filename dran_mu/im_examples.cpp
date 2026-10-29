@@ -6,12 +6,13 @@
 //   Cache Region   - automatic cache for host loads/stores (SSD misses handled by the device)
 //   Preload Region - data you explicitly preloadMemory(); the ONLY memory MU kernels may read
 //
-// Examples (run one or several):  ./im_examples [--device N] [--ex 12345]
+// Examples (run one or several):  ./im_examples [--device N] [--ex 123456]
 //   1  plain memory: allocate, write, read back
-//   2  make data durable on the SSD: commitSyncMemory
+//   2  write dirty pages to the SSD: commitSyncMemory (data still ends with the process)
 //   3  sparse reads: prefetchMemory first, then read
 //   4  keep hot data in DRAM: pinMemory / unpinMemory
 //   5  compute on the card: preload -> MU kernel -> check -> unload
+//   6  reuse a preloaded slot: overwrite it from the host, never unload (no SSD write-back)
 //
 // None of these write filler data or evict anything, so they are safe on a shared card.
 // Each step prints the change in the card's SSD byte counters (from `xcena_cli im get-smart`):
@@ -22,14 +23,17 @@
 //   - call pxl::flushHostCache after the host writes and before the host re-reads device output
 //   - an MU kernel on a buffer that is NOT preloaded returns Success with wrong results
 //
-// Build: listed in CMakeLists.txt; example 5 needs mu_kernel/mu_kernel.mubin (dran_mix_values).
+// Build: listed in CMakeLists.txt; examples 5 and 6 need mu_kernel/mu_kernel.mubin (dran_mix_values).
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "pxl/pxl.hpp"
 
@@ -150,12 +154,14 @@ void ex1()
     pxl::releaseMemory(p);  // release discards the data (it unmaps the range)
 }
 
-// 2. Durability. Writes first land in the DRAM cache ("dirty"). commitSyncMemory writes the
+// 2. Commit. Writes first land in the DRAM cache ("dirty"). commitSyncMemory writes the
 //    dirty pages of a range to the SSD and waits. The data stays cached and readable.
+//    This is NOT persistence across processes: releaseMemory and process exit drop the
+//    mapping, and the data cannot be reached again. Keep a copy in a file if it must survive.
 //    (commitMemory is the asynchronous form.)
 void ex2()
 {
-    printf("\n== 2  make data durable: commitSyncMemory ==\n");
+    printf("\n== 2  write dirty pages to the SSD: commitSyncMemory ==\n");
     void* p = pxl::allocateMemory(gDev, GB);
     if (!p) { printf("  allocateMemory failed\n"); return; }
     fill(p, GB, 2);
@@ -279,11 +285,138 @@ void ex5()
     pxl::releaseMemory(V);
     pxl::releaseMemory(arena);
 }
+
+// 6. Reuse a preloaded slot instead of unload/preload. unloadMemory always writes the region
+//    back to the SSD, even if nothing changed. To switch the data the MU sees without that
+//    write-back: preload a "slot" once, keep the master copies elsewhere in InfiniteMemory, and
+//    overwrite the slot from the host. Questions this answers (nvme_write tells):
+//      a. do host writes into a preloaded range stay in device DRAM (no SSD write)?
+//      b. does the MU see the new data after flushHostCache?
+//      c. does an idle preloaded, dirty range get written back in the background?
+//      d. does releaseMemory without unloadMemory write back, and does it free the slot?
+//    Masters are plain InfiniteMemory (cached here, so the copy is DRAM -> DRAM; a cold master
+//    adds SSD reads). Needs mu_kernel/mu_kernel.mubin. Uses 2 GB of the Preload Region.
+constexpr int kOut = 3072;  // column length (fp16 elements), like a V column
+half_t gPat[1024];          // fp16 of 0..1023, all exact
+inline half_t pat(size_t col, int row, uint64_t seed) { return gPat[(col * 7 + row + seed * 13) % 1024]; }
+
+void fillPattern(half_t* p, size_t bytes, uint64_t seed)
+{
+    const size_t cols = bytes / (kOut * sizeof(half_t));
+    for (size_t c = 0; c < cols; c++)
+        for (int r = 0; r < kOut; r++) p[c * kOut + r] = pat(c, r, seed);
+    pxl::flushHostCache(p, bytes);
+}
+
+void parCopy(void* dst, const void* src, size_t bytes, int threads = 8)
+{
+    std::vector<std::thread> t;
+    const size_t chunk = (bytes / threads + 4095) & ~size_t(4095);
+    for (int i = 0; i < threads; i++)
+    {
+        const size_t off = i * chunk;
+        if (off >= bytes) break;
+        const size_t n = std::min(chunk, bytes - off);
+        t.emplace_back([=] { std::memcpy(static_cast<uint8_t*>(dst) + off, static_cast<const uint8_t*>(src) + off, n); });
+    }
+    for (auto& x : t) x.join();
+}
+
+void ex6()
+{
+    printf("\n== 6  reuse a preloaded slot: overwrite from the host, never unload ==\n");
+    for (int i = 0; i < 1024; i++) gPat[i] = f2h(static_cast<float>(i));
+    auto* mod = pxl::createModule("mu_kernel/mu_kernel.mubin");
+    auto* job = gCtx->createJob();
+    if (!mod || !job || job->load(mod) != pxl::Result::Success) { printf("  module load failed\n"); return; }
+    auto exec = job->buildMap(mod->createFunction("dran_mix_values"), 64);
+
+    auto* mA = static_cast<half_t*>(pxl::allocateMemory(gDev, GB));
+    auto* mB = static_cast<half_t*>(pxl::allocateMemory(gDev, GB));
+    auto* slot = static_cast<half_t*>(pxl::allocateMemory(gDev, GB));
+    auto* arena = static_cast<uint8_t*>(pxl::allocateMemory(gDev, GB));
+    if (!mA || !mB || !slot || !arena) { printf("  allocateMemory failed\n"); return; }
+    auto* idx = reinterpret_cast<uint32_t*>(arena);
+    auto* w = reinterpret_cast<float*>(arena + 4096);
+    auto* out = reinterpret_cast<float*>(arena + 8192);
+    const size_t cols = GB / (kOut * sizeof(half_t));
+
+    printf("  masters A and B: 1 GB each, %zu columns of %d fp16\n", cols, kOut);
+    fillPattern(mA, GB, 1);
+    fillPattern(mB, GB, 2);
+    step("commitSyncMemory(masters, 2 GB)", [&] {
+        const pxl::MemoryStatus s = pxl::commitSyncMemory(mA, GB);
+        return s != pxl::MemoryStatus::Success ? s : pxl::commitSyncMemory(mB, GB);
+    });
+    parCopy(slot, mA, GB);
+    pxl::flushHostCache(slot, GB);
+    step("preloadMemory(slot = A, 1 GB)", [&] { return pxl::preloadMemory(slot, GB); });
+    step("preloadMemory(arena, 1 GB)", [&] { return pxl::preloadMemory(arena, GB); });
+
+    // MU reads 8 columns spread over the slot (first and last included) and they are compared
+    // with the pattern of `seed`. A stale slot shows the other master's pattern.
+    auto muCheck = [&](uint64_t seed) {
+        int ok = 0;
+        for (int j = 0; j < 8; j++)
+        {
+            const size_t c = j == 7 ? cols - 1 : j * (cols / 7);
+            idx[0] = static_cast<uint32_t>(c);
+            w[0] = 1.0f;
+            pxl::flushHostCache(arena, 8192);
+            if (exec->execute(slot, idx, w, kOut, 1, out) != pxl::Result::Success || exec->synchronize() != pxl::Result::Success)
+                return -1;
+            pxl::flushHostCache(out, kOut * sizeof(float));
+            int good = 0;
+            for (int r = 0; r < kOut; r++) good += out[r] == static_cast<float>((c * 7 + r + seed * 13) % 1024);
+            ok += good == kOut;
+        }
+        return ok;
+    };
+    printf("  MU check after preload: %d / 8 columns match A\n", muCheck(1));
+
+    const int rounds = 6;
+    const Ssd s0 = readSsd();
+    for (int i = 0; i < rounds; i++)
+    {
+        const uint64_t seed = i % 2 ? 1 : 2;  // B, A, B, ...
+        auto t0 = std::chrono::steady_clock::now();
+        parCopy(slot, seed == 1 ? mA : mB, GB);
+        const double cp = msSince(t0);
+        t0 = std::chrono::steady_clock::now();
+        pxl::flushHostCache(slot, GB);
+        const double fl = msSince(t0);
+        printf("  overwrite %d with %c: copy %6.1f ms (%.2f GB/s), flush %6.1f ms | MU sees new data: %d / 8\n",
+               i + 1, seed == 1 ? 'A' : 'B', cp, GB / cp / 1e6, fl, muCheck(seed));
+    }
+    const Ssd s1 = readSsd();
+    if (s0.rd >= 0 && s1.rd >= 0)
+        printf("  a. %d overwrites (%d GB written into the slot): SSD read %.1f MB, write %.1f MB  (want ~0)\n",
+               rounds, rounds, (s1.rd - s0.rd) / 1e6, (s1.wr - s0.wr) / 1e6);
+
+    const int idle = 20;
+    printf("  c. idle %d s with a dirty preloaded slot ...\n", idle);
+    std::this_thread::sleep_for(std::chrono::seconds(idle));
+    const Ssd s2 = readSsd();
+    if (s1.rd >= 0 && s2.rd >= 0)
+        printf("     SSD read %.1f MB, write %.1f MB  (want ~0)\n", (s2.rd - s1.rd) / 1e6, (s2.wr - s1.wr) / 1e6);
+
+    step("d. releaseMemory(slot), no unload", [&] { pxl::releaseMemory(slot); return pxl::MemoryStatus::Success; });
+    // If the release freed the slot's Preload Region space, a new 1 GB preload succeeds.
+    auto* probe = pxl::allocateMemory(gDev, GB);
+    if (probe)
+    {
+        step("   preloadMemory(new 1 GB) after release", [&] { return pxl::preloadMemory(probe, GB); });
+        step("   releaseMemory(new 1 GB), no unload", [&] { pxl::releaseMemory(probe); return pxl::MemoryStatus::Success; });
+    }
+    pxl::releaseMemory(arena);
+    pxl::releaseMemory(mA);
+    pxl::releaseMemory(mB);
+}
 }  // namespace
 
 int main(int argc, char* argv[])
 {
-    std::string ex = "12345";
+    std::string ex = "12345";  // 6 is opt-in: --ex 6
     for (int i = 1; i < argc; i++)
     {
         if (!strcmp(argv[i], "--device") && i + 1 < argc) gDev = std::atoi(argv[++i]);
@@ -297,5 +430,6 @@ int main(int argc, char* argv[])
     if (ex.find('3') != std::string::npos) ex3();
     if (ex.find('4') != std::string::npos) ex4();
     if (ex.find('5') != std::string::npos) ex5();
+    if (ex.find('6') != std::string::npos) ex6();
     return 0;
 }
