@@ -22,7 +22,8 @@
 //   ./im_tenant_bench [--users 32] [-n 500000] [--slots 8] [--queries 300] [--zipf 1.0]
 //                     [--swap copy|preload] [-d 1024] [-o 3072] [-k 64] [-i 3]
 //                     [-t 2816] [-b 4] [--threads 8] [--csv out.csv] [--device N]
-//                     [--warmup 200] [--policy lru|lfu] [--merge split|single] [--fb-tasks 256]
+//                     [--warmup 200] [--policy lru|lfu] [--merge split|single] [--fb-tasks 256] [--local-k 64]
+//   --local-k   per-task top-k kept by the scan (<= k); the merge still returns the global top k
 //   --warmup W  the first W queries run but are not counted (cold start of every user)
 //   --policy    victim choice when a cold user needs a slot: lru = least recently used;
 //               lfu = fewest queries so far (ties: least recent). Empty slots are used first.
@@ -161,7 +162,7 @@ double pct(std::vector<double> v, double p)
 
 int main(int argc, char* argv[])
 {
-    int users = 32, slots = 8, queries = 600, warmup = 200, fbTasks = 256, dim = 1024, outDim = 3072, topK = 64, iters = 3;
+    int users = 32, slots = 8, queries = 600, warmup = 200, fbTasks = 256, localK = 0, dim = 1024, outDim = 3072, topK = 64, iters = 3;
     int tasks = 2816, batch = 4, threads = 8;
     size_t M = 500000;
     double zipf = 1.0;
@@ -189,10 +190,12 @@ int main(int argc, char* argv[])
         else if (a == "--policy") policy = nx();
         else if (a == "--merge") merge = nx();
         else if (a == "--fb-tasks") fbTasks = std::stoi(nx());
+        else if (a == "--local-k") localK = std::stoi(nx());
         else if (a == "--device") gDev = std::stoi(nx());
     }
     const bool copyMode = swap == "copy";
     const bool lfu = policy == "lfu", split = merge == "split";
+    if (localK <= 0 || localK > topK) localK = topK;
     if ((policy != "lru" && !lfu) || (merge != "split" && merge != "single") || warmup >= queries)
     {
         printf("bad arguments: --policy lru|lfu, --merge split|single, warmup < queries\n");
@@ -211,6 +214,7 @@ int main(int argc, char* argv[])
            users, M, dim, outDim, topK, iters, slots, queries, warmup, zipf);
     printf("  policy=%s  merge=%s", policy.c_str(), merge.c_str());
     if (split) printf(" (feedback tasks %d)", fbTasks);
+    printf("  local-k %d", localK);
     printf("\n");
     printf("  per user: K %.2f GiB (alloc %zu GiB), V %.2f GiB (alloc %zu GiB); all users %.1f GiB\n",
            kBytes / double(GiB), kAlloc / GiB, vBytes / double(GiB), vAlloc / GiB,
@@ -371,13 +375,13 @@ int main(int argc, char* argv[])
         for (int it = 0; it < iters; it++)
         {
             auto ti = Clock::now();
-            if (scanX->execute(keys, query, dim, uint64_t(M), topK, partS, partI) != pxl::Result::Success ||
+            if (scanX->execute(keys, query, dim, uint64_t(M), localK, partS, partI) != pxl::Result::Success ||
                 scanX->synchronize() != pxl::Result::Success) { printf("scan failed\n"); return 1; }
             row.scan += msSince(ti);
             ti = Clock::now();
             const pxl::Result e = split
-                ? mfX->execute(partS, partI, tasks * topK, topK, query, dim, topK, winI)
-                : mfX->execute(partS, partI, tasks * topK, topK, keys, dim, topK, winI, query);
+                ? mfX->execute(partS, partI, tasks * localK, localK, query, dim, topK, winI)
+                : mfX->execute(partS, partI, tasks * localK, localK, keys, dim, topK, winI, query);
             if (e != pxl::Result::Success || mfX->synchronize() != pxl::Result::Success) { printf("merge failed\n"); return 1; }
             // split form: next query = K(:, winners) . w, unnormalized (the next merge divides by |q|)
             if (split && it + 1 < iters &&
