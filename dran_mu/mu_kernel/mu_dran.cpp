@@ -259,6 +259,110 @@ void dran_merge_feedback(const float* partScores,
 }
 
 // ---------------------------------------------------------------------------
+// Stage 1b, split form: the same result as dran_merge_feedback, with the feedback
+// moved to a row-parallel kernel. In the single-task form one core does
+// k x dim scalar loads (64 x 1024) for the feedback, which dominates its time.
+//
+//   dran_merge_softmax (1 task): merge + softmax, as above. The query it was
+//     given may be unnormalized (the split feedback does not normalize), so the
+//     scores are divided by |query| first; that equals scoring with
+//     normalize(query), which is what dran_merge_feedback feeds the next scan.
+//   dran_feedback_rows (many tasks): queryOut[r] = sum_i w_i K(r, winner_i),
+//     each task its own rows. Unnormalized; the next merge accounts for it.
+//
+// Per iteration: scan -> merge_softmax -> feedback_rows (skip the last feedback).
+// ---------------------------------------------------------------------------
+void dran_merge_softmax(const float* partScores,
+                        const uint32_t* partIndices,
+                        int numCand,
+                        int candStride,
+                        const half* query,
+                        int dim,
+                        int topK,
+                        uint32_t* winnersOut)
+{
+    if (mu::getTaskIdx() != 0)
+    {
+        return;
+    }
+    if (topK > K_MAX)
+    {
+        topK = K_MAX;
+    }
+
+    float scores[K_MAX];
+    uint32_t indices[K_MAX];
+    for (int i = 0; i < topK; i++)
+    {
+        scores[i] = -3.0e38f;
+        indices[i] = 0;
+    }
+    for (int base = 0; base < numCand; base += candStride)
+    {
+        const int end = (base + candStride < numCand) ? base + candStride : numCand;
+        for (int j = base; j < end; j++)
+        {
+            if (partScores[j] <= scores[topK - 1])
+            {
+                break;
+            }
+            topkInsert(scores, indices, topK, partScores[j], partIndices[j]);
+        }
+    }
+
+    float qn = 0.0f;
+    for (int r = 0; r < dim; r++)
+    {
+        const float v = static_cast<float>(query[r]);
+        qn += v * v;
+    }
+    const float invQ = 1.0f / (sqrtf(qn) + 1e-9f);
+
+    float* weights = reinterpret_cast<float*>(winnersOut + topK);
+    const float top = scores[0];
+    float wsum = 0.0f;
+    for (int i = 0; i < topK; i++)
+    {
+        const float e = expf(BETA * (scores[i] - top) * invQ);
+        weights[i] = e;
+        wsum += e;
+    }
+    const float inv = 1.0f / wsum;
+    for (int i = 0; i < topK; i++)
+    {
+        weights[i] *= inv;
+        winnersOut[i] = indices[i];
+    }
+}
+
+void dran_feedback_rows(const half* keys,
+                        const uint32_t* winners,
+                        int dim,
+                        int topK,
+                        half* queryOut)
+{
+    const int taskIdx = static_cast<int>(mu::getTaskIdx());
+    const int taskCount = static_cast<int>(mu::getTaskCount());
+    if (topK > K_MAX)
+    {
+        topK = K_MAX;
+    }
+    const float* weights = reinterpret_cast<const float*>(winners + topK);
+    const int perTask = (dim + taskCount - 1) / taskCount;
+    const int rowBegin = taskIdx * perTask;
+    const int rowEnd = (rowBegin + perTask < dim) ? rowBegin + perTask : dim;
+    for (int r = rowBegin; r < rowEnd; r++)
+    {
+        float acc = 0.0f;
+        for (int i = 0; i < topK; i++)
+        {
+            acc += weights[i] * static_cast<float>(keys[static_cast<uint64_t>(winners[i]) * dim + r]);
+        }
+        queryOut[r] = static_cast<half>(acc);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stage 2 — weighted mix of the winning value columns.
 //
 //   values  : V, o x M, column-major, fp16
@@ -304,4 +408,6 @@ void dran_mix_values(const half* values,
 MU_KERNEL_ADD(dran_scan_topk);
 MU_KERNEL_ADD(dran_scan_topk_q);
 MU_KERNEL_ADD(dran_merge_feedback);
+MU_KERNEL_ADD(dran_merge_softmax);
+MU_KERNEL_ADD(dran_feedback_rows);
 MU_KERNEL_ADD(dran_mix_values);

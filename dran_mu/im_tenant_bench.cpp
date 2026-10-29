@@ -22,6 +22,12 @@
 //   ./im_tenant_bench [--users 32] [-n 500000] [--slots 8] [--queries 300] [--zipf 1.0]
 //                     [--swap copy|preload] [-d 1024] [-o 3072] [-k 64] [-i 3]
 //                     [-t 2816] [-b 4] [--threads 8] [--csv out.csv] [--device N]
+//                     [--warmup 200] [--policy lru|lfu] [--merge split|single] [--fb-tasks 256]
+//   --warmup W  the first W queries run but are not counted (cold start of every user)
+//   --policy    victim choice when a cold user needs a slot: lru = least recently used;
+//               lfu = fewest queries so far (ties: least recent). Empty slots are used first.
+//   --merge     split (default) = 1-task merge/softmax + row-parallel feedback kernel;
+//               single = the original 1-task dran_merge_feedback (for comparison)
 // Defaults: K 0.95 GiB + V 2.9 GiB per user, 32 users = 128 GB total (> the ~57 GB Cache
 // Region, so V and cold K reads reach the SSD), 8 computable users.
 // Limits from the kernels: k <= 64, dim <= 1024.
@@ -155,11 +161,11 @@ double pct(std::vector<double> v, double p)
 
 int main(int argc, char* argv[])
 {
-    int users = 32, slots = 8, queries = 300, dim = 1024, outDim = 3072, topK = 64, iters = 3;
+    int users = 32, slots = 8, queries = 600, warmup = 200, fbTasks = 256, dim = 1024, outDim = 3072, topK = 64, iters = 3;
     int tasks = 2816, batch = 4, threads = 8;
     size_t M = 500000;
     double zipf = 1.0;
-    std::string swap = "copy", csv;
+    std::string swap = "copy", csv, policy = "lru", merge = "split";
     for (int i = 1; i < argc; i++)
     {
         auto nx = [&] { return std::string(argv[++i]); };
@@ -179,9 +185,19 @@ int main(int argc, char* argv[])
         else if (a == "-b") batch = std::stoi(nx());
         else if (a == "--threads") threads = std::stoi(nx());
         else if (a == "--csv") csv = nx();
+        else if (a == "--warmup") warmup = std::stoi(nx());
+        else if (a == "--policy") policy = nx();
+        else if (a == "--merge") merge = nx();
+        else if (a == "--fb-tasks") fbTasks = std::stoi(nx());
         else if (a == "--device") gDev = std::stoi(nx());
     }
     const bool copyMode = swap == "copy";
+    const bool lfu = policy == "lfu", split = merge == "split";
+    if ((policy != "lru" && !lfu) || (merge != "split" && merge != "single") || warmup >= queries)
+    {
+        printf("bad arguments: --policy lru|lfu, --merge split|single, warmup < queries\n");
+        return 1;
+    }
     if ((swap != "copy" && swap != "preload") || topK > 64 || dim > 1024 || dim % 4 || outDim % 4 || slots > users)
     {
         printf("bad arguments: --swap copy|preload, k <= 64, dim <= 1024, dim/outDim multiples of 4, slots <= users\n");
@@ -191,8 +207,11 @@ int main(int argc, char* argv[])
     const size_t kAlloc = upGiB(kBytes), vAlloc = upGiB(vBytes);
     const size_t dW = dim / 4, oW = outDim / 4;  // 64-bit words per column
     printf("im_tenant_bench  device=%d  swap=%s\n", gDev, swap.c_str());
-    printf("  users=%d  M=%zu  dim=%d  outDim=%d  k=%d  iters=%d  slots=%d  queries=%d  zipf=%.2f\n",
-           users, M, dim, outDim, topK, iters, slots, queries, zipf);
+    printf("  users=%d  M=%zu  dim=%d  outDim=%d  k=%d  iters=%d  slots=%d  queries=%d (warmup %d)  zipf=%.2f\n",
+           users, M, dim, outDim, topK, iters, slots, queries, warmup, zipf);
+    printf("  policy=%s  merge=%s", policy.c_str(), merge.c_str());
+    if (split) printf(" (feedback tasks %d)", fbTasks);
+    printf("\n");
     printf("  per user: K %.2f GiB (alloc %zu GiB), V %.2f GiB (alloc %zu GiB); all users %.1f GiB\n",
            kBytes / double(GiB), kAlloc / GiB, vBytes / double(GiB), vAlloc / GiB,
            users * double(kAlloc + vAlloc) / GiB);
@@ -261,8 +280,10 @@ int main(int argc, char* argv[])
     auto* job = ctx->createJob();
     if (!mod || !job || job->load(mod) != pxl::Result::Success) { printf("module load failed\n"); return 1; }
     auto scanX = job->buildMap(mod->createFunction("dran_scan_topk_q"), tasks);
-    auto mfX = job->buildMap(mod->createFunction("dran_merge_feedback"), 1);
+    auto mfX = job->buildMap(mod->createFunction(split ? "dran_merge_softmax" : "dran_merge_feedback"), 1);
+    auto fbX = job->buildMap(mod->createFunction("dran_feedback_rows"), fbTasks);
     if (batch > 0) scanX->setBatchSize(batch);
+    fbX->setBatchSize(1);  // tiny tasks: one per core
 
     // ---- Zipf user stream (rank r -> user r-1; fixed seed) ----
     std::vector<double> cdf(users);
@@ -272,29 +293,39 @@ int main(int argc, char* argv[])
     auto urand = [&] { rs = mix64(rs); return (rs >> 11) / 9007199254740992.0; };
 
     std::vector<int> slotUser(slots, -1), userSlot(users, -1);
-    std::vector<long> lastUse(slots, -1);
-    struct Row { int u; bool cold; bool hit; bool vok; double swap, scan, mf, vget, mix, total; };
+    std::vector<long> lastUse(slots, -1), freq(users, 0);
+    struct Row { int q, u; bool cold; bool hit; bool vok; double swap, scan, mf, vget, mix, total; };
     std::vector<Row> rows;
     std::vector<float> xi(dim), outV(outDim);
     std::vector<half_t> vbuf(size_t(topK) * outDim);
     long swaps = 0;
 
-    printf("\nrunning %d queries ...\n", queries);
-    const Ssd sRun0 = readSsd();
+    printf("\nrunning %d queries (%d warmup) ...\n", queries, warmup);
+    Ssd sRun0;
     for (int q = 0; q < queries; q++)
     {
+        if (q == warmup) sRun0 = readSsd();
         const double x = urand() * z;
         const int u = int(std::lower_bound(cdf.begin(), cdf.end(), x) - cdf.begin());
-        Row row{u, false, false, false, 0, 0, 0, 0, 0, 0};
+        freq[u]++;
+        Row row{q, u, false, false, false, 0, 0, 0, 0, 0, 0};
         const auto tq = Clock::now();
 
-        // -- bring the user in if needed (LRU victim) --
+        // -- bring the user in if needed (empty slot first, then the policy's victim) --
         int s = userSlot[u];
         if (s < 0)
         {
             row.cold = true;
-            swaps++;
-            s = int(std::min_element(lastUse.begin(), lastUse.end()) - lastUse.begin());
+            if (q >= warmup) swaps++;
+            s = 0;
+            for (int t = 1; t < slots; t++)
+            {
+                const bool empty = slotUser[t] < 0, emptyS = slotUser[s] < 0;
+                if (empty != emptyS) { if (empty) s = t; continue; }
+                if (empty) continue;
+                const long ft = freq[slotUser[t]], fs = freq[slotUser[s]];
+                if (lfu ? (ft < fs || (ft == fs && lastUse[t] < lastUse[s])) : lastUse[t] < lastUse[s]) s = t;
+            }
             const int victim = slotUser[s];
             const auto ts = Clock::now();
             if (copyMode)
@@ -344,8 +375,14 @@ int main(int argc, char* argv[])
                 scanX->synchronize() != pxl::Result::Success) { printf("scan failed\n"); return 1; }
             row.scan += msSince(ti);
             ti = Clock::now();
-            if (mfX->execute(partS, partI, tasks * topK, topK, keys, dim, topK, winI, query) != pxl::Result::Success ||
-                mfX->synchronize() != pxl::Result::Success) { printf("merge failed\n"); return 1; }
+            const pxl::Result e = split
+                ? mfX->execute(partS, partI, tasks * topK, topK, query, dim, topK, winI)
+                : mfX->execute(partS, partI, tasks * topK, topK, keys, dim, topK, winI, query);
+            if (e != pxl::Result::Success || mfX->synchronize() != pxl::Result::Success) { printf("merge failed\n"); return 1; }
+            // split form: next query = K(:, winners) . w, unnormalized (the next merge divides by |q|)
+            if (split && it + 1 < iters &&
+                (fbX->execute(keys, winI, dim, topK, query) != pxl::Result::Success ||
+                 fbX->synchronize() != pxl::Result::Success)) { printf("feedback failed\n"); return 1; }
             row.mf += msSince(ti);
         }
         pxl::flushHostCache(winI, size_t(topK) * 8);
@@ -387,7 +424,7 @@ int main(int argc, char* argv[])
         std::vector<double> tot, sw, sc, vg;
         int hit = 0, vok = 0;
         for (auto& r : rows)
-            if (all || r.cold == want)
+            if (r.q >= warmup && (all || r.cold == want))
             {
                 tot.push_back(r.total); sw.push_back(r.swap); sc.push_back(r.scan); vg.push_back(r.vget);
                 hit += r.hit; vok += r.vok;
@@ -398,14 +435,18 @@ int main(int argc, char* argv[])
                hit, tot.size(), vok, tot.size());
     };
     printf("\n--- summary (%s, %d slots for %d users) ---\n", swap.c_str(), slots, users);
-    printf("  slot hit rate: %.1f%%  (%ld swaps in %d queries)\n", 100.0 * (queries - swaps) / queries, swaps, queries);
+    const int measured = queries - warmup;
+    printf("  measured queries %d..%d\n", warmup, queries - 1);
+    printf("  slot hit rate: %.1f%%  (%ld swaps in %d queries); static top-%d users get %.1f%% of queries\n",
+           100.0 * (measured - swaps) / measured, swaps, measured, slots, 100.0 * cdf[slots - 1] / z);
     summary("hot", false, false);
     summary("cold", true, false);
     summary("all", false, true);
     printSsd("during queries", sRun0, sRun1);
-    if (sRun0.wr >= 0 && sRun1.wr >= 0 && swaps)
-        printf("  SSD write per swap: %.1f MB  (copy mode should be ~0; preload mode ~ K alloc %.0f MB)\n",
-               (sRun1.wr - sRun0.wr) / 1e6 / swaps, kAlloc / 1e6);
+    if (sRun0.rd >= 0 && sRun1.rd > sRun0.rd)
+        printf("  SSD write / read: %.3f   SSD read per query: %.1f MB   write per swap: %.1f MB\n",
+               double(sRun1.wr - sRun0.wr) / double(sRun1.rd - sRun0.rd), (sRun1.rd - sRun0.rd) / 1e6 / measured,
+               swaps ? (sRun1.wr - sRun0.wr) / 1e6 / swaps : 0.0);
 
     if (!csv.empty())
     {
@@ -415,7 +456,7 @@ int main(int argc, char* argv[])
             for (size_t i = 0; i < rows.size(); i++)
             {
                 const Row& r = rows[i];
-                fprintf(f, "%zu,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", i, r.u, r.cold, r.hit, r.vok, r.swap,
+                fprintf(f, "%d,%d,%d,%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n", r.q, r.u, r.cold, r.hit, r.vok, r.swap,
                         r.scan, r.mf, r.vget, r.mix, r.total);
             }
             fclose(f);
