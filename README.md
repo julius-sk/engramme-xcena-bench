@@ -10,8 +10,13 @@ Lanes A, B2 and B3 read the key matrix from an NVMe SSD on every recall.
 | B2 | GPU | SSD → pinned DRAM → PCIe → HBM | 380.8 ms |
 | B3 | GPU | SSD → HBM with GPUDirect Storage | 300.4 ms |
 | C | XCENA MX1P MU cores | K/V resident in card DRAM; 2 KB in, 12.8 KB out | 161.0 ms |
+| D | XCENA MX1P MU cores, InfiniteMemory | K on the card's SSD: copied into a computable slot every recall; V rows read from the card | not yet measured |
+| Dhot | XCENA MX1P MU cores, InfiniteMemory | K already in the computable slot; V rows read from the card | not yet measured |
 
-All four lanes must report `(HIT)`: the planted probe column wins the recall.
+All lanes must report `(HIT)`: the planted probe column wins the recall. Lanes D and Dhot
+(`dran_mu/im_tenant_bench.cpp --data`) read the same `K.bin` / `V.bin` bytes as A, B2 and B3,
+and print a `lane-comparable recall p50` line. D keeps 32 copies on the card and visits them in
+turn, so each K fetch comes from the card's SSD, as A, B2 and B3 read K from the NVMe drive.
 
 ## Workload
 

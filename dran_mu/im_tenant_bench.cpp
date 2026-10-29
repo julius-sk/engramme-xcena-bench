@@ -24,6 +24,14 @@
 //                     [-t 2816] [-b 4] [--threads 8] [--csv out.csv] [--device N]
 //                     [--warmup 200] [--policy lru|lfu] [--merge split|single] [--fb-tasks 256] [--local-k 64]
 //   --local-k   per-task top-k kept by the scan (<= k); the merge still returns the global top k
+//   --order     zipf (default) or cyclic (user = query % users: with users x K larger than the
+//               Cache Region, every K fetch then comes from the SSD)
+//   --data DIR  lane-comparison mode: every user's K and V are copies of DIR/K.bin and DIR/V.bin,
+//               the files the other lanes use (run_lanes.sh setup). M is taken from the file size.
+//               V.bin carries no tags, so the V check is skipped; HIT is still checked.
+//               Lane-comparable runs (see run_lanes.sh D / Dhot):
+//                 cold: --data DIR --users 32 --slots 1 --order cyclic   (K from SSD every recall)
+//                 hot:  --data DIR --users 1  --slots 1                  (K already computable)
 //   --warmup W  the first W queries run but are not counted (cold start of every user)
 //   --policy    victim choice when a cold user needs a slot: lru = least recently used;
 //               lfu = fewest queries so far (ties: least recent). Empty slots are used first.
@@ -166,7 +174,7 @@ int main(int argc, char* argv[])
     int tasks = 2816, batch = 4, threads = 8;
     size_t M = 500000;
     double zipf = 1.0;
-    std::string swap = "copy", csv, policy = "lru", merge = "split";
+    std::string swap = "copy", csv, policy = "lru", merge = "split", order = "zipf", data;
     for (int i = 1; i < argc; i++)
     {
         auto nx = [&] { return std::string(argv[++i]); };
@@ -191,9 +199,33 @@ int main(int argc, char* argv[])
         else if (a == "--merge") merge = nx();
         else if (a == "--fb-tasks") fbTasks = std::stoi(nx());
         else if (a == "--local-k") localK = std::stoi(nx());
+        else if (a == "--order") order = nx();
+        else if (a == "--data") data = nx();
         else if (a == "--device") gDev = std::stoi(nx());
     }
-    const bool copyMode = swap == "copy";
+    const bool copyMode = swap == "copy", cyclic = order == "cyclic", laneData = !data.empty();
+    if (order != "zipf" && !cyclic) { printf("bad arguments: --order zipf|cyclic\n"); return 1; }
+    std::vector<uint8_t> hostK;  // lane mode: K.bin in host memory (fill source, probe columns)
+    if (laneData)
+    {
+        FILE* fk = fopen((data + "/K.bin").c_str(), "rb");
+        FILE* fv = fopen((data + "/V.bin").c_str(), "rb");
+        if (!fk || !fv) { printf("cannot open %s/K.bin or V.bin (run_lanes.sh setup)\n", data.c_str()); return 1; }
+        fseek(fk, 0, SEEK_END);
+        fseek(fv, 0, SEEK_END);
+        const long long kb = ftell(fk), vb = ftell(fv);
+        M = size_t(kb) / (size_t(dim) * 2);
+        if (size_t(kb) != M * dim * 2 || size_t(vb) != M * outDim * 2)
+        {
+            printf("K.bin / V.bin sizes do not match dim=%d outDim=%d\n", dim, outDim);
+            return 1;
+        }
+        hostK.resize(size_t(kb));
+        fseek(fk, 0, SEEK_SET);
+        if (fread(hostK.data(), 1, hostK.size(), fk) != hostK.size()) { printf("short read on K.bin\n"); return 1; }
+        fclose(fk);
+        fclose(fv);
+    }
     const bool lfu = policy == "lfu", split = merge == "split";
     if (localK <= 0 || localK > topK) localK = topK;
     if ((policy != "lru" && !lfu) || (merge != "split" && merge != "single") || warmup >= queries)
@@ -214,7 +246,8 @@ int main(int argc, char* argv[])
            users, M, dim, outDim, topK, iters, slots, queries, warmup, zipf);
     printf("  policy=%s  merge=%s", policy.c_str(), merge.c_str());
     if (split) printf(" (feedback tasks %d)", fbTasks);
-    printf("  local-k %d", localK);
+    printf("  local-k %d  order=%s", localK, order.c_str());
+    if (laneData) printf("  data=%s (lane files)", data.c_str());
     printf("\n");
     printf("  per user: K %.2f GiB (alloc %zu GiB), V %.2f GiB (alloc %zu GiB); all users %.1f GiB\n",
            kBytes / double(GiB), kAlloc / GiB, vBytes / double(GiB), vAlloc / GiB,
@@ -237,7 +270,23 @@ int main(int argc, char* argv[])
     {
         auto* k = reinterpret_cast<uint64_t*>(K[u]);
         auto* v = reinterpret_cast<uint64_t*>(V[u]);
-        parFor(M, threads, [&](size_t b, size_t e) {
+        if (laneData)
+        {
+            parCopy(K[u], hostK.data(), kBytes, threads);
+            FILE* fv = fopen((data + "/V.bin").c_str(), "rb");
+            std::vector<uint8_t> buf(256ull << 20);
+            size_t off = 0, n;
+            while (fv && (n = fread(buf.data(), 1, buf.size(), fv)) > 0)
+            {
+                parCopy(reinterpret_cast<uint8_t*>(V[u]) + off, buf.data(), n, threads);
+                off += n;
+            }
+            if (fv) fclose(fv);
+            if (off != vBytes) { printf("short read on V.bin\n"); return 1; }
+            pxl::flushHostCache(K[u], kBytes);
+            pxl::flushHostCache(V[u], vBytes);
+        }
+        else parFor(M, threads, [&](size_t b, size_t e) {
             for (size_t c = b; c < e; c++)
             {
                 for (size_t w = 0; w < dW; w++) k[c * dW + w] = kWord(u, c, w);
@@ -310,7 +359,7 @@ int main(int argc, char* argv[])
     {
         if (q == warmup) sRun0 = readSsd();
         const double x = urand() * z;
-        const int u = int(std::lower_bound(cdf.begin(), cdf.end(), x) - cdf.begin());
+        const int u = cyclic ? q % users : int(std::lower_bound(cdf.begin(), cdf.end(), x) - cdf.begin());
         freq[u]++;
         Row row{q, u, false, false, false, 0, 0, 0, 0, 0, 0};
         const auto tq = Clock::now();
@@ -360,7 +409,9 @@ int main(int argc, char* argv[])
         float nrm = 0.0f;
         for (size_t w = 0; w < dW; w++)
         {
-            const uint64_t v = kWord(u, probe, w);
+            uint64_t v;
+            if (laneData) std::memcpy(&v, hostK.data() + (probe * dW + w) * 8, 8);
+            else v = kWord(u, probe, w);
             for (int j = 0; j < 4; j++) xi[w * 4 + j] = h2f(half_t(v >> (16 * j)));
         }
         for (int r = 0; r < dim; r++) nrm += xi[r] * xi[r];
@@ -403,7 +454,7 @@ int main(int argc, char* argv[])
             std::memcpy(vbuf.data() + size_t(i) * outDim, src, colB);
             uint64_t tag;
             std::memcpy(&tag, vbuf.data() + size_t(i) * outDim, 8);
-            vok &= tag == vTag(u, winI[i]);
+            vok &= laneData || tag == vTag(u, winI[i]);
         }
         row.vget = msSince(tv);
         row.vok = vok;
@@ -425,18 +476,23 @@ int main(int argc, char* argv[])
 
     // ---- summary ----
     auto summary = [&](const char* name, bool want, bool all) {
-        std::vector<double> tot, sw, sc, vg;
+        std::vector<double> tot, sw, sc, vg, mf;
         int hit = 0, vok = 0;
         for (auto& r : rows)
             if (r.q >= warmup && (all || r.cold == want))
             {
                 tot.push_back(r.total); sw.push_back(r.swap); sc.push_back(r.scan); vg.push_back(r.vget);
+                mf.push_back(r.mf);
                 hit += r.hit; vok += r.vok;
             }
         if (tot.empty()) { printf("  %-5s none\n", name); return; }
         printf("  %-5s n=%4zu  total p50 %7.1f p99 %7.1f ms | swap p50 %7.1f | scan p50 %6.1f | V gather p50 %6.1f p99 %6.1f | HIT %d/%zu  V ok %d/%zu\n",
                name, tot.size(), pct(tot, .5), pct(tot, .99), pct(sw, .5), pct(sc, .5), pct(vg, .5), pct(vg, .99),
                hit, tot.size(), vok, tot.size());
+        if (all && laneData)
+            printf("  lane-comparable recall p50: K fetch %.1f + scan %.1f + merge %.1f + V gather %.1f = %.1f ms (total p50 %.1f)\n",
+                   pct(sw, .5), pct(sc, .5), pct(mf, .5), pct(vg, .5),
+                   pct(sw, .5) + pct(sc, .5) + pct(mf, .5) + pct(vg, .5), pct(tot, .5));
     };
     printf("\n--- summary (%s, %d slots for %d users) ---\n", swap.c_str(), slots, users);
     const int measured = queries - warmup;
